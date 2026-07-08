@@ -1,0 +1,115 @@
+name: bing-search-test
+
+# Probe whether the internal "Fast Search API" (Bing Grounding) behind Azure
+# Front Door is usable from a public GitHub-hosted runner.
+#   Endpoint: https://eureka-search-bbbgamfpgxbkapcy.b02.azurefd.net  (public in the source gist)
+#   Auth scope: api://31865153-1259-48aa-b2f1-424424d2f09a/.default
+# Cheapest-first: (1) reachability without auth, (2) auth feasibility (detect
+# whether Azure OIDC/SP secrets are configured; only then attempt a token + search).
+# No credentials are hardcoded. Nothing is printed that could leak a token.
+
+on:
+  push:
+    branches: [bing-search-probe]
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # required for azure/login OIDC, harmless if unused
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    env:
+      SEARCH_BASE: https://eureka-search-bbbgamfpgxbkapcy.b02.azurefd.net
+      SEARCH_SCOPE: api://31865153-1259-48aa-b2f1-424424d2f09a/.default
+    steps:
+      # ----- Step 1: Reachability (NO auth). An internal AFD endpoint may be
+      # network/WAF/private-link restricted and unreachable from public runners.
+      # We expect 401/403 if reachable-but-unauthenticated; a timeout/000 or a
+      # generic AFD block page means network-restricted.
+      - name: Reachability (root, no auth)
+        run: |
+          set -x
+          echo "== curl root, no auth =="
+          code=$(curl -sS -o /tmp/root.body -w '%{http_code}' --max-time 30 "$SEARCH_BASE/" || echo "000")
+          echo "ROOT_HTTP_CODE=$code"
+          echo "-- first 400 bytes of body --"
+          head -c 400 /tmp/root.body || true
+          echo
+          echo "== curl /openapi.json, no auth =="
+          oc=$(curl -sS -o /tmp/openapi.body -w '%{http_code}' --max-time 30 "$SEARCH_BASE/openapi.json" || echo "000")
+          echo "OPENAPI_HTTP_CODE=$oc"
+          echo "== curl /api/v1/search (POST, no auth) — expect 401/403 if reachable =="
+          sc=$(curl -sS -o /tmp/search.body -w '%{http_code}' --max-time 30 \
+            -X POST "$SEARCH_BASE/api/v1/search" \
+            -H 'Content-Type: application/json' \
+            -d '{"query":"reachability probe","max_num_results":1}' || echo "000")
+          echo "SEARCH_NOAUTH_HTTP_CODE=$sc"
+          head -c 300 /tmp/search.body || true
+          echo
+          echo "REACHABILITY_SUMMARY root=$code openapi=$oc search_noauth=$sc"
+
+      # ----- Step 2: Detect whether Azure auth is even configured in this repo.
+      # We look for the standard OIDC vars/secrets. If absent, we report
+      # "auth not configured" and skip the auth path (do NOT fail opaquely).
+      - name: Detect Azure auth configuration
+        id: authcfg
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+        run: |
+          have_oidc=false
+          have_secret=false
+          if [ -n "$AZURE_CLIENT_ID" ] && [ -n "$AZURE_TENANT_ID" ]; then
+            if [ -n "$AZURE_CLIENT_SECRET" ]; then have_secret=true; else have_oidc=true; fi
+          fi
+          echo "have_oidc=$have_oidc"   >> "$GITHUB_OUTPUT"
+          echo "have_secret=$have_secret" >> "$GITHUB_OUTPUT"
+          if [ "$have_oidc" = "true" ] || [ "$have_secret" = "true" ]; then
+            echo "AUTH_CONFIG=present (oidc=$have_oidc secret=$have_secret)"
+          else
+            echo "AUTH_CONFIG=absent — no AZURE_CLIENT_ID/TENANT_ID secrets found; skipping token+search."
+          fi
+
+      # ----- Step 3 (conditional): Azure login via OIDC workload-identity
+      # federation (the id-token: write permission above enables this). A
+      # client-secret path would instead pass `creds` JSON; OIDC is preferred
+      # and needs no long-lived secret.
+      - name: Azure login (OIDC, only if configured)
+        if: steps.authcfg.outputs.have_oidc == 'true'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # ----- Step 4 (conditional): mint a token for the CUSTOM scope and run a
+      # real search. The token is written to a file and never echoed; only the
+      # HTTP code, result count, and titles/urls are printed.
+      - name: Authenticated search (only if logged in)
+        if: steps.authcfg.outputs.have_oidc == 'true'
+        run: |
+          set -o pipefail
+          echo "== minting token for custom scope (not printed) =="
+          if ! az account get-access-token --scope "$SEARCH_SCOPE" \
+                --query accessToken -o tsv > /tmp/tok 2>/tmp/tokerr; then
+            echo "TOKEN_MINT=failed"
+            head -c 300 /tmp/tokerr
+            exit 0
+          fi
+          echo "TOKEN_MINT=ok (len=$(wc -c < /tmp/tok))"
+          for q in "who won the 2022 FIFA World Cup" "latest Kubernetes stable version" "Azure Front Door pricing"; do
+            echo "== QUERY: $q =="
+            code=$(curl -sS -o /tmp/r.json -w '%{http_code}' --max-time 40 \
+              -X POST "$SEARCH_BASE/api/v1/search" \
+              -H "Authorization: Bearer $(cat /tmp/tok)" \
+              -H 'Content-Type: application/json' \
+              -d "{\"query\":\"$q\",\"max_num_results\":5,\"fulltext\":false}" || echo "000")
+            echo "SEARCH_HTTP_CODE=$code"
+            jq -r 'if .success then "count=\(.data|length)" else "resp=\(.|tostring[0:200])" end' /tmp/r.json 2>/dev/null || head -c 200 /tmp/r.json
+            jq -r '.data[]? | "  - \(.title[0:60]) | \(.url)"' /tmp/r.json 2>/dev/null | head -5 || true
+          done
+          rm -f /tmp/tok

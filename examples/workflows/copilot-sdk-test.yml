@@ -1,0 +1,73 @@
+name: Copilot SDK on Runner - Probe
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/copilot-sdk-test.yml'
+
+permissions:
+  contents: read
+  models: read
+
+jobs:
+  builtin-token:
+    name: Built-in GITHUB_TOKEN (expected fail)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Install Copilot CLI/SDK
+        run: |
+          npm install -g @github/copilot && echo "installed @github/copilot" || echo "install failed"
+          which copilot || true
+      - name: CLI info
+        run: |
+          copilot --version || true
+          echo "----- help -----"
+          copilot --help || true
+      - name: Attempt inference (built-in token)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COPILOT_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +x
+          echo "=== attempt 1: copilot -p --allow-all-tools ==="
+          copilot -p "Reply with exactly: OK" --allow-all-tools 2>&1 | tee out.txt; echo "exit=${PIPESTATUS[0]}"
+          echo "=== token type (masked; only prefix shown) ==="
+          echo "${COPILOT_GITHUB_TOKEN:0:4}****  len=${#COPILOT_GITHUB_TOKEN}"
+
+  user-pat:
+    name: COPILOT_GITHUB_TOKEN secret (real path)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Install Copilot CLI/SDK
+        run: |
+          npm install -g @github/copilot && echo "installed" || echo "install failed"
+          which copilot || true
+      - name: CLI info
+        run: |
+          copilot --version || true
+          echo "----- help -----"
+          copilot --help || true
+      - name: Attempt inference (user PAT)
+        env:
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+        run: |
+          set +x
+          if [ -z "$COPILOT_GITHUB_TOKEN" ]; then echo "secret COPILOT_GITHUB_TOKEN not set"; exit 1; fi
+          echo "=== attempt: copilot -p --allow-all-tools ==="
+          copilot -p "Reply with exactly: OK" --allow-all-tools 2>&1 | tee out.txt; rc=${PIPESTATUS[0]}
+          echo "exit=$rc"
+          if [ "$rc" -ne 0 ]; then
+            echo "=== retry without --allow-all-tools (in case flag unsupported) ==="
+            copilot -p "Reply with exactly: OK" 2>&1 | tee out2.txt; echo "exit=${PIPESTATUS[0]}"
+          fi
+          exit $rc

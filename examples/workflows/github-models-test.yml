@@ -1,0 +1,96 @@
+name: GitHub Models on Runner - Probe
+
+on:
+  push:
+    branches: [models-probe]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  models: read
+
+jobs:
+  catalog:
+    runs-on: ubuntu-latest
+    steps:
+      - name: List available models
+        env:
+          GH_MODELS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          curl -s https://models.github.ai/catalog/models \
+            -H "Authorization: Bearer $GH_MODELS_TOKEN" \
+            -H "Accept: application/json" \
+            -w '\nCATALOG_HTTP %{http_code}\n' -o cat.json
+          echo "=== raw HTTP status line above ==="
+          echo "=== catalog ids (sorted) ==="
+          jq -r '.[].id' cat.json 2>/dev/null | sort
+          echo "=== count ==="
+          jq -r 'length' cat.json 2>/dev/null || echo "jq-parse-failed"
+          echo "=== head of raw body (in case not an array) ==="
+          head -c 2000 cat.json; echo
+
+  inference-curl:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Try best models via curl
+        env:
+          GH_MODELS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          # Ranked best-available. gpt-5.5 is not in the catalog for this account.
+          # gpt-5 / o-series reasoning models reject max_tokens and require
+          # max_completion_tokens, so send that field for them.
+          MODELS="openai/gpt-5 openai/o3 openai/o4-mini openai/gpt-4.1 deepseek/DeepSeek-R1 meta/Llama-4-Maverick-17B-128E-Instruct-FP8"
+          for M in $MODELS; do
+            echo "======================================================"
+            echo "=== MODEL: $M ==="
+            case "$M" in
+              openai/gpt-5*|openai/o1*|openai/o3*|openai/o4*)
+                # reasoning models burn tokens on hidden reasoning; give headroom
+                TOKFIELD="max_completion_tokens"; TOKN=2048 ;;
+              *)
+                TOKFIELD="max_tokens"; TOKN=16 ;;
+            esac
+            body=$(printf '{"model":"%s","messages":[{"role":"user","content":"Reply with exactly: OK"}],"%s":%s}' "$M" "$TOKFIELD" "$TOKN")
+            resp=$(curl -s -w $'\nHTTP_CODE:%{http_code}' \
+              https://models.github.ai/inference/chat/completions \
+              -H "Authorization: Bearer $GH_MODELS_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "$body")
+            code=$(printf '%s' "$resp" | sed -n 's/.*HTTP_CODE:\([0-9]*\)$/\1/p')
+            payload=$(printf '%s' "$resp" | sed 's/HTTP_CODE:[0-9]*$//')
+            echo "HTTP $code"
+            content=$(printf '%s' "$payload" | jq -r '.choices[0].message.content // empty' 2>/dev/null)
+            if [ -n "$content" ]; then
+              echo "COMPLETION: $content"
+              echo "VERDICT: WORKS ($M)"
+            else
+              err=$(printf '%s' "$payload" | jq -r '.error.code // .error.message // empty' 2>/dev/null)
+              echo "ERROR: ${err:-<none-parsed>}"
+              echo "RAW: $(printf '%s' "$payload" | head -c 600)"
+              case "$code" in
+                403) echo "VERDICT: FORBIDDEN/ENTITLEMENT ($M)";;
+                404) echo "VERDICT: NOT-AVAILABLE ($M)";;
+                429) echo "VERDICT: RATE-LIMITED ($M)";;
+                401) echo "VERDICT: AUTH-FAILED ($M)";;
+                *)   echo "VERDICT: FAILED-$code ($M)";;
+              esac
+            fi
+          done
+
+  inference-action:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/ai-inference@v1
+        id: inf
+        continue-on-error: true
+        with:
+          model: openai/gpt-4.1
+          prompt: "Reply with exactly: OK"
+      - name: Show action response
+        run: |
+          echo "action-outcome: ${{ steps.inf.outcome }}"
+          echo "response<<EOF"
+          echo "${{ steps.inf.outputs.response }}"
+          echo "EOF"
