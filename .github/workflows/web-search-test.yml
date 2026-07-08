@@ -1,0 +1,124 @@
+name: Web Search Probe - Copilot CLI raw results
+
+on:
+  push:
+    branches:
+      - web-search-probe
+    paths:
+      - '.github/workflows/web-search-test.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  models: read
+
+jobs:
+  copilot-web-search:
+    name: Copilot CLI web_search raw-results probe
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install Copilot CLI
+        run: |
+          npm install -g @github/copilot && echo "installed @github/copilot" || echo "install failed"
+          which copilot || true
+          copilot --version || true
+
+      - name: Enumerate available tools (confirm web_search present with seat token)
+        env:
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+        run: |
+          set +x
+          if [ -z "$COPILOT_GITHUB_TOKEN" ]; then echo "secret COPILOT_GITHUB_TOKEN not set"; exit 1; fi
+          echo "=== TOOL LIST ==="
+          copilot -p "List every tool you have available to you right now, one per line, exact tool names only. Do not use any tools, just list them." \
+            --allow-all-tools --no-color -s 2>&1 | tee tools.txt
+          echo "=== web_search present? ==="
+          grep -q '^web_search$' tools.txt && echo "WEB_SEARCH_TOOL: PRESENT" || echo "WEB_SEARCH_TOOL: ABSENT"
+          grep -q '^web_fetch$' tools.txt && echo "WEB_FETCH_TOOL: PRESENT" || echo "WEB_FETCH_TOOL: ABSENT"
+
+      - name: Run web_search across varied queries (coerce to raw JSON)
+        env:
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+        run: |
+          set +x
+          declare -a QUERIES=(
+            "GitHub Models API rate limits"
+            "SpaceX Starship latest flight test outcome 2026"
+            "Rust 1.85 release notes edition 2024"
+            "WHO guidance on daily sugar intake grams"
+            "Nobel Prize in Physics 2025 laureates"
+          )
+          overall_rc=0
+          for i in "${!QUERIES[@]}"; do
+            q="${QUERIES[$i]}"
+            n=$((i+1))
+            echo ""
+            echo "########## QUERY $n: $q ##########"
+            out="q${n}.json"
+            copilot -p "Use the web_search tool to search for: \"$q\". Then output ONLY a JSON array of the raw search results, each object with keys \"title\",\"url\",\"snippet\". Output nothing else but the JSON array. Do not summarize or answer the question." \
+              --allow-tool 'web_search' --no-color -s > "$out" 2>&1
+            rc=$?
+            echo "--- raw agent output (query $n, exit=$rc) ---"
+            cat "$out"
+            echo ""
+            echo "--- extracted URLs (query $n) ---"
+            # Extract http(s) URLs found anywhere in the output as evidence of resolvable pointers
+            grep -oE 'https?://[^"[:space:]]+' "$out" | sort -u | tee "urls${n}.txt"
+            cnt=$(wc -l < "urls${n}.txt" | tr -d ' ')
+            echo "URL_COUNT query $n = $cnt"
+            if [ "$cnt" -lt 1 ]; then
+              echo "WARN: query $n returned 0 URLs"
+              overall_rc=1
+            fi
+          done
+          echo ""
+          echo "########## SUMMARY ##########"
+          for n in 1 2 3 4 5; do
+            c=$(wc -l < "urls${n}.txt" 2>/dev/null | tr -d ' ' || echo 0)
+            echo "query $n url_count=$c"
+          done
+          exit $overall_rc
+
+      - name: Consistency re-run (query 1 twice more)
+        env:
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+        continue-on-error: true
+        run: |
+          set +x
+          q="GitHub Models API rate limits"
+          for r in a b; do
+            echo "########## CONSISTENCY RUN $r ##########"
+            copilot -p "Use the web_search tool to search for: \"$q\". Then output ONLY a JSON array of the raw search results, each object with keys \"title\",\"url\",\"snippet\". Output nothing else but the JSON array." \
+              --allow-tool 'web_search' --no-color -s 2>&1 | tee "consistency_${r}.txt"
+            echo "--- urls run $r ---"
+            grep -oE 'https?://[^"[:space:]]+' "consistency_${r}.txt" | sort -u
+          done
+
+  github-models-negative-control:
+    name: GitHub Models negative control (cannot reach web)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Ask a bare GitHub Models call to "search the web"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +x
+          echo "=== Bare GitHub Models chat: no tools, asked to search the web ==="
+          resp=$(curl -sS -X POST "https://models.github.ai/inference/chat/completions" \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "model": "openai/gpt-4o-mini",
+              "messages": [
+                {"role":"user","content":"Search the web for the current top headline on nytimes.com right now and give me the exact URL and headline text. If you cannot access the internet, say exactly: NO_WEB_ACCESS."}
+              ]
+            }')
+          echo "$resp"
+          echo ""
+          echo "=== verdict ==="
+          echo "$resp" | grep -qi "NO_WEB_ACCESS" && echo "NEGATIVE_CONTROL: model admits NO web access (expected)" || echo "NEGATIVE_CONTROL: check response above (model may have hallucinated a URL)"
