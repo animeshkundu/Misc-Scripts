@@ -1,0 +1,54 @@
+name: Condukt SDK Spike
+
+on:
+  push:
+    branches:
+      - condukt-sdk-spike
+    paths:
+      - '.github/workflows/condukt-sdk-spike.yml'
+      - 'spikes/condukt-sdk/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  condukt-sdk-spike:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install Copilot CLI globally
+        run: |
+          npm i -g @github/copilot
+          which copilot
+          echo "COPILOT_CLI_PATH=$(which copilot)" >> "$GITHUB_ENV"
+          copilot --version
+
+      - name: Install spike dependencies
+        working-directory: spikes/condukt-sdk
+        run: npm ci
+
+      - name: Typecheck
+        working-directory: spikes/condukt-sdk
+        run: npm run typecheck
+
+      - name: Run condukt SDK spike
+        working-directory: spikes/condukt-sdk
+        env:
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+        run: npx tsx run.ts
+
+      - name: Print generated files
+        if: always()
+        working-directory: spikes/condukt-sdk
+        run: |
+          echo "=== generated files ==="
+          find run-output -maxdepth 5 -type f -print -exec sh -c 'echo "--- $1"; sed -n "1,160p" "$1"' _ {} \; || true
