@@ -9,6 +9,7 @@ import { CopilotClient, approveAll } from '@github/copilot-sdk';
 import type { SessionConfig as CopilotSdkSessionConfig } from '@github/copilot-sdk';
 import type {
   AgentConfig,
+  AgentRuntime,
   ExecutionEvent,
   ExecutionProjection,
   FlowGraph,
@@ -246,9 +247,33 @@ function makeAgentEntry(config: AgentConfig): NodeEntry {
   };
 }
 
-function createRuntime() {
+function createRuntime(): AgentRuntime {
   const backend = new SdkBackend({ configDir: repoRoot });
-  return adaptCopilotBackend(backend);
+  const adapted = adaptCopilotBackend(backend);
+
+  return {
+    ...adapted,
+    async createSession(config) {
+      safeLog('[ADAPTER_FORWARD_CONFIG]', {
+        model: config.model,
+        thinkingBudget: config.thinkingBudget,
+        availableTools: config.availableTools,
+        excludedTools: config.excludedTools,
+        systemMessagePresent: Boolean(config.systemMessage),
+      });
+      return (await backend.createSession({
+        model: config.model,
+        thinkingBudget: config.thinkingBudget,
+        cwd: config.cwd,
+        addDirs: config.addDirs,
+        timeout: config.timeout,
+        heartbeatTimeout: config.heartbeatTimeout,
+        systemMessage: config.systemMessage,
+        availableTools: config.availableTools,
+        excludedTools: config.excludedTools,
+      } as any)) as any;
+    },
+  };
 }
 
 function readArtifact(dir: string, name: string): string | null {
