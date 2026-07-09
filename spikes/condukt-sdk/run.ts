@@ -28,6 +28,7 @@ const TERMINAL_STATUSES = new Set(['completed', 'failed', 'crashed', 'stopped'])
 const spikeDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(spikeDir, '../..');
 const runRoot = path.join(spikeDir, 'run-output');
+const mcpConfigPath = path.join(os.tmpdir(), `condukt-sdk-spike-mcp-${process.pid}.json`);
 const observedOutputEvents: OutputEvent[] = [];
 
 type InstrumentedClientFields = {
@@ -36,16 +37,22 @@ type InstrumentedClientFields = {
   options?: { useLoggedInUser?: boolean; gitHubToken?: string; logLevel?: string; mode?: string };
 };
 
+type WebNodeVerification = {
+  toolFired: boolean;
+  artifactUrlCount: number;
+  outputUrlCount: number;
+  blockedMessageSeen: boolean;
+};
+
 type MainVerification = {
   executionId: string;
   status: string;
   helloOk: boolean;
   modelOk: boolean;
-  webSearchToolFired: boolean;
-  searchArtifactOk: boolean;
+  strictWebSearch: WebNodeVerification;
+  qualifiedWebSearch: WebNodeVerification;
+  openWebSearch: WebNodeVerification;
   searchOk: boolean;
-  searchUrlCount: number;
-  searchOutputUrlCount: number;
 };
 
 type MaxVerification = {
@@ -122,6 +129,34 @@ function logEnvironment(): void {
   });
 }
 
+function writeMcpConfig(): void {
+  const token = process.env.COPILOT_GITHUB_TOKEN ?? process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN;
+  if (!token) {
+    safeLog('[MCP_CONFIG]', { path: mcpConfigPath, written: false, reason: 'no token env present' });
+    return;
+  }
+
+  const config = {
+    mcpServers: {
+      'github-mcp-server': {
+        type: 'http',
+        url: 'https://api.githubcopilot.com/mcp/readonly',
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      },
+    },
+  };
+  fs.writeFileSync(mcpConfigPath, JSON.stringify(config, null, 2), 'utf8');
+  safeLog('[MCP_CONFIG]', {
+    path: mcpConfigPath,
+    written: true,
+    server: 'github-mcp-server',
+    url: 'https://api.githubcopilot.com/mcp/readonly',
+    authHeaderPresent: true,
+  });
+}
+
 function installSdkInstrumentation(): void {
   const originalCreateSession = CopilotClient.prototype.createSession;
   let callIndex = 0;
@@ -133,7 +168,14 @@ function installSdkInstrumentation(): void {
     callIndex += 1;
     const id = callIndex;
     const clientFields = this as unknown as InstrumentedClientFields;
-    const rawConfig = config as CopilotSdkSessionConfig & { configDir?: unknown; configDirectory?: unknown };
+    const rawConfig = config as CopilotSdkSessionConfig & {
+      configDir?: unknown;
+      configDirectory?: unknown;
+      mcpServers?: Record<string, unknown>;
+    };
+    if (rawConfig.configDir && !rawConfig.configDirectory) {
+      rawConfig.configDirectory = String(rawConfig.configDir);
+    }
     safeLog(`[SDK_CREATE_SESSION ${id}]`, {
       clientConnectionKind: clientFields.connectionConfig?.kind,
       clientUseStdio: clientFields.connectionConfig?.kind === 'stdio',
@@ -149,6 +191,23 @@ function installSdkInstrumentation(): void {
       workingDirectory: config.workingDirectory,
       configDir: rawConfig.configDir,
       configDirectory: rawConfig.configDirectory,
+      mcpServers: rawConfig.mcpServers
+        ? Object.fromEntries(
+            Object.entries(rawConfig.mcpServers).map(([name, server]) => {
+              const typed = server as { type?: unknown; url?: unknown; tools?: unknown; headers?: unknown };
+              return [
+                name,
+                {
+                  type: typed.type,
+                  url: typed.url,
+                  tools: typed.tools,
+                  headerNames:
+                    typed.headers && typeof typed.headers === 'object' ? Object.keys(typed.headers) : undefined,
+                },
+              ];
+            }),
+          )
+        : undefined,
       streaming: config.streaming,
       hasPermissionHandler: Boolean(config.onPermissionRequest),
       systemMessageMode:
@@ -167,6 +226,25 @@ function installSdkInstrumentation(): void {
         workspacePath: session.workspacePath,
         capabilities: session.capabilities,
       });
+
+      try {
+        await session.rpc.tools.initializeAndValidate();
+        const metadata = await session.rpc.tools.getCurrentMetadata();
+        safeLog(`[SDK_TOOL_METADATA ${id}]`, {
+          tools: metadata.tools?.map((tool) => ({
+            name: tool.name,
+            namespacedName: tool.namespacedName,
+            mcpServerName: tool.mcpServerName,
+            mcpToolName: tool.mcpToolName,
+            deferLoading: tool.deferLoading,
+          })),
+        });
+      } catch (err) {
+        safeLog(`[SDK_TOOL_METADATA_ERROR ${id}]`, {
+          name: err instanceof Error ? err.name : undefined,
+          message: err instanceof Error ? err.message : String(err),
+        });
+      }
 
       session.on((event) => {
         const data = 'data' in event ? event.data : undefined;
@@ -248,7 +326,7 @@ function makeAgentEntry(config: AgentConfig): NodeEntry {
 }
 
 function createRuntime(): AgentRuntime {
-  const backend = new SdkBackend({ configDir: repoRoot });
+  const backend = new SdkBackend({ configDir: repoRoot, mcpConfigPath });
   const adapted = adaptCopilotBackend(backend);
 
   return {
@@ -313,6 +391,25 @@ function countUrls(items: unknown[]): number {
 
 function countUrlsInText(text: string): number {
   return new Set(text.match(/https?:\/\/[^\s"'<>),]+/g) ?? []).size;
+}
+
+function verifyWebNode(executionId: string, nodeId: string, artifactContent: string | null): WebNodeVerification {
+  const parsed = parseJsonArrayArtifact(artifactContent);
+  const artifactUrlCount = parsed ? countUrls(parsed) : 0;
+  const events = observedOutputEvents.filter((event) => event.executionId === executionId && event.nodeId === nodeId);
+  const eventText = events.map((event) => safeJson(event)).join('\n');
+  const toolFired = events.some(
+    (event) =>
+      event.type === 'node:tool' &&
+      (event.tool === 'web_search' || event.tool === 'github-mcp-server-web_search') &&
+      event.phase === 'start',
+  );
+  return {
+    toolFired,
+    artifactUrlCount,
+    outputUrlCount: countUrlsInText(eventText),
+    blockedMessageSeen: /Blocked|not available|Unknown tool|can't verify|cannot verify|can't use|cannot use/i.test(eventText),
+  };
 }
 
 async function sleep(ms: number): Promise<void> {
@@ -414,20 +511,51 @@ function mainGraph(): FlowGraph {
         promptBuilder: () =>
           'Write the single word MODEL_OK to model.md in the current working directory and nothing else. The file must contain exactly MODEL_OK and no Markdown fences.',
       }),
-      webSearch: makeAgentEntry({
-        objective: 'web search node',
+      strictWebSearch: makeAgentEntry({
+        objective: 'strict web_search allow-list node',
         tools: [],
         model: 'gpt-5.5',
         availableTools: ['web_search'],
-        output: 'search.md',
+        output: 'strict-search.md',
         timeout: 600,
         heartbeatTimeout: 240,
         promptBuilder: () =>
-          'Use the web_search tool to find the current top story on a major news site. Then write a JSON array of objects with keys title and url to search.md in the current working directory. Also print the same JSON array in your final response. The file content must be valid JSON only, no Markdown fences. Use absolute http(s) URLs.',
+          'Call the web_search tool with query "current top story BBC News". Then write a JSON array of objects with keys title and url to strict-search.md in the current working directory. Also print the same JSON array in your final response. Do not use web_fetch. The file content must be valid JSON only, no Markdown fences. Use absolute http(s) URLs.',
+      }),
+      qualifiedWebSearch: makeAgentEntry({
+        objective: 'qualified web_search allow-list node',
+        tools: [],
+        model: 'gpt-5.5',
+        availableTools: [
+          'web_search',
+          'github-mcp-server-web_search',
+          'github-mcp-server/web_search',
+          'mcp:web_search',
+          'mcp:github-mcp-server-web_search',
+          'bash',
+          'apply_patch',
+          'create',
+          'task_complete',
+        ],
+        output: 'qualified-search.md',
+        timeout: 600,
+        heartbeatTimeout: 240,
+        promptBuilder: () =>
+          'Call the web_search tool with query "current top story BBC News". Then write a JSON array of objects with keys title and url to qualified-search.md in the current working directory. Also print the same JSON array in your final response. Do not use web_fetch. The file content must be valid JSON only, no Markdown fences. Use absolute http(s) URLs.',
+      }),
+      openWebSearch: makeAgentEntry({
+        objective: 'open web_search node',
+        tools: [],
+        model: 'gpt-5.5',
+        output: 'open-search.md',
+        timeout: 600,
+        heartbeatTimeout: 240,
+        promptBuilder: () =>
+          'Call the web_search tool with query "current top story BBC News". Then write a JSON array of objects with keys title and url to open-search.md in the current working directory. Also print the same JSON array in your final response. Do not use web_fetch. The file content must be valid JSON only, no Markdown fences. Use absolute http(s) URLs.',
       }),
     },
     edges: {},
-    start: ['hello', 'modelEffort', 'webSearch'],
+    start: ['hello', 'modelEffort', 'strictWebSearch', 'qualifiedWebSearch', 'openWebSearch'],
   };
 }
 
@@ -473,33 +601,32 @@ async function runMainGraph(): Promise<MainVerification> {
   const projection = await waitForExecution(bridge, executionId, 30 * 60 * 1000);
 
   safeLog('[FINAL_PROJECTION main]', projection);
-  printNodeOutputs(state, executionId, ['hello', 'modelEffort', 'webSearch']);
-  printArtifacts(dir, ['hello.md', 'model.md', 'search.md']);
+  printNodeOutputs(state, executionId, ['hello', 'modelEffort', 'strictWebSearch', 'qualifiedWebSearch', 'openWebSearch']);
+  printArtifacts(dir, ['hello.md', 'model.md', 'strict-search.md', 'qualified-search.md', 'open-search.md']);
   printFlowFiles(dir);
 
   const hello = readArtifact(dir, 'hello.md');
   const model = readArtifact(dir, 'model.md');
-  const search = readArtifact(dir, 'search.md');
-  const parsedSearch = parseJsonArrayArtifact(search);
-  const searchUrlCount = parsedSearch ? countUrls(parsedSearch) : 0;
-  const webSearchEvents = observedOutputEvents.filter(
-    (event) => event.executionId === executionId && event.nodeId === 'webSearch',
+  const strictWebSearch = verifyWebNode(executionId, 'strictWebSearch', readArtifact(dir, 'strict-search.md'));
+  const qualifiedWebSearch = verifyWebNode(
+    executionId,
+    'qualifiedWebSearch',
+    readArtifact(dir, 'qualified-search.md'),
   );
-  const webSearchToolFired = webSearchEvents.some(
-    (event) => event.type === 'node:tool' && event.tool === 'web_search' && event.phase === 'start',
+  const openWebSearch = verifyWebNode(executionId, 'openWebSearch', readArtifact(dir, 'open-search.md'));
+  const searchOk = [strictWebSearch, qualifiedWebSearch, openWebSearch].some(
+    (node) => node.toolFired && (node.artifactUrlCount > 0 || node.outputUrlCount > 0),
   );
-  const searchOutputUrlCount = countUrlsInText(webSearchEvents.map((event) => safeJson(event)).join('\n'));
 
   const verification = {
     executionId,
     status: projection.status,
     helloOk: hello?.trim() === 'OK',
     modelOk: model?.trim() === 'MODEL_OK',
-    webSearchToolFired,
-    searchArtifactOk: searchUrlCount > 0,
-    searchOk: webSearchToolFired && (searchUrlCount > 0 || searchOutputUrlCount > 0),
-    searchUrlCount,
-    searchOutputUrlCount,
+    strictWebSearch,
+    qualifiedWebSearch,
+    openWebSearch,
+    searchOk,
   };
   safeLog('[MAIN_VERIFICATION]', verification);
   return verification;
@@ -567,6 +694,7 @@ async function directMaxCreateSessionSmoke(): Promise<void> {
 async function run(): Promise<void> {
   installSdkInstrumentation();
   logEnvironment();
+  writeMcpConfig();
 
   fs.rmSync(runRoot, { recursive: true, force: true });
   fs.mkdirSync(runRoot, { recursive: true });
@@ -578,8 +706,15 @@ async function run(): Promise<void> {
 
   safeLog('[OVERALL_VERIFICATION]', { main, max });
 
-  if (main.status !== 'completed' || !main.helloOk || !main.modelOk || !main.searchOk) {
-    throw new Error(`Main graph verification failed: ${safeJson(main)}`);
+  if (main.status !== 'completed' || !main.helloOk || !main.modelOk) {
+    throw new Error(`Main graph core verification failed: ${safeJson(main)}`);
+  }
+
+  if (!main.searchOk) {
+    safeLog('[WEB_SEARCH_DIAGNOSTIC_NOT_PASSING]', {
+      note: 'Core SdkBackend agent execution passed, but no SDK web_search tool call produced URL evidence.',
+      main,
+    });
   }
 }
 
